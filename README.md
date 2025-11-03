@@ -84,6 +84,8 @@ chmod +x run.sh
 
 ## Architecture
 
+![Architecture image](https://github.com/ninoaddict/raft-protocol-java/blob/main/public/achitecture.png)
+
 ### Protocol Buffers
 
 The system uses two main protobuf service definitions:
