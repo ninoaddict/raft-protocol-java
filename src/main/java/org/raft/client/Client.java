@@ -1,0 +1,263 @@
+package org.raft.client;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Scanner;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import org.raft.kvstore.rpc.ClientRequest;
+import org.raft.kvstore.rpc.ClientResponse;
+import org.raft.kvstore.rpc.KVStoreServiceGrpc;
+import org.raft.kvstore.rpc.MemberChangeArgs;
+import org.raft.kvstore.rpc.MemberChangeReply;
+import org.raft.kvstore.rpc.RequestLogArgs;
+import org.raft.kvstore.rpc.RequestLogReply;
+import org.raft.raft.rpc.LogEntry;
+
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.StatusRuntimeException;
+
+public class Client {
+    private static final Logger logger = Logger.getLogger(Client.class.getName());
+    private ManagedChannel channel;
+    private KVStoreServiceGrpc.KVStoreServiceBlockingStub blockingStub;
+    private String currentServerAddress;
+    private static final int MAX_REDIRECTS = 5;
+
+    public Client(String initialServerAddress) {
+        this.currentServerAddress = initialServerAddress;
+        connect(initialServerAddress);
+    }
+
+    private void connect(String serverAddress) {
+        shutdown();
+        logger.log(Level.INFO, "Trying to connect to server: {0}", serverAddress);
+        try {
+            this.channel = ManagedChannelBuilder.forTarget(serverAddress)
+                    .usePlaintext()
+                    .build();
+            this.blockingStub = KVStoreServiceGrpc.newBlockingStub(channel);
+            this.currentServerAddress = serverAddress;
+            logger.log(Level.INFO, "Successfully connected to: {0}", serverAddress);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to connect to {0}: {1}", new Object[]{serverAddress, e.getMessage()});
+            this.channel = null;
+            this.blockingStub = null;
+        }
+    }
+
+    public void shutdown() {
+        if (channel != null && !channel.isShutdown()) {
+            try {
+                logger.log(Level.INFO, "Closing connection to: {0}", currentServerAddress);
+                channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                logger.log(Level.WARNING, "Failed to close connection properly.", e);
+                Thread.currentThread().interrupt();
+            }
+        }
+        channel = null;
+        blockingStub = null;
+    }
+
+    public void executeCommand(String commandString) {
+        if (commandString == null || commandString.trim().isEmpty()) {
+            logger.warning("Command must not be empty.");
+            return;
+        }
+
+        if (commandString.startsWith("connect")) {
+            String[] parts = commandString.split(" ", 2);
+            if (parts.length == 2 && !parts[1].trim().isEmpty()) {
+                connect(parts[1].trim());
+            } else {
+                logger.warning("Usage: connect <host:port>");
+            }
+            return;
+        }
+        if (commandString.equalsIgnoreCase("exit") || commandString.equalsIgnoreCase("quit")) {
+            System.out.println("Exit from client.");
+            shutdown();
+            System.exit(0);
+        }
+
+
+        int redirects = 0;
+        String rawCommand = commandString;
+
+        while (redirects < MAX_REDIRECTS) {
+            if (blockingStub == null) {
+                logger.severe("Not connected to any server.\nTry to run 'connect <host:port>' first.");
+                System.out.println("ERROR: Not connected to any server.");
+                return;
+            }
+
+            try {
+                if (rawCommand.equalsIgnoreCase("REQUEST_LOG")) {
+                    RequestLogArgs logRequest = RequestLogArgs.newBuilder().build();
+                    logger.log(Level.INFO, "Sending REQUEST_LOG to {0}", currentServerAddress);
+                    RequestLogReply logReply = blockingStub.requestLog(logRequest);
+
+                    if (logReply.getSuccess()) {
+                        System.out.println("Log from leader (" + logReply.getLeaderAddress() + "):");
+                        if (logReply.getLogsCount() == 0) {
+                            System.out.println("(Empty log)");
+                        } else {
+                            for (int i = 0; i < logReply.getLogsCount(); i++) {
+                                LogEntry entry = logReply.getLogs(i);
+                                System.out.print("  Index " + i + ": Term=" + entry.getTerm());
+                                System.out.print(" Type=" + entry.getType());
+                                if (entry.getKey() != null && !entry.getKey().isEmpty()) {
+                                    System.out.print(" Key=" + entry.getKey());
+                                }
+                                if (entry.getValue() != null && !entry.getValue().isEmpty()) {
+                                    System.out.print(" Value=" + entry.getValue());
+                                }
+                                if (!entry.getOldConfList().isEmpty()) {
+                                    System.out.print(" OldConfList=" + entry.getOldConfList());
+                                }
+                                if (!entry.getNewConfList().isEmpty()) {
+                                    System.out.print(" NewConfList=" + entry.getNewConfList());
+                                }
+                                System.out.println();
+                            }
+                        }
+                        return;
+                    } else {
+                        if (!logReply.getLeaderAddress().isEmpty()) {
+                            logger.log(Level.INFO, "Not leader.\nLeader Address: {0}. Mencoba redirect...", logReply.getLeaderAddress());
+                            System.out.println("REDIRECT: This node is not a leader. Trying to redirect to " + logReply.getLeaderAddress());
+                            connect(logReply.getLeaderAddress());
+                            redirects++;
+                        } else {
+                            logger.warning("Log request failed.");
+                            System.out.println("ERROR: Failed to get log.\nThere's no information about the leader address.");
+                            return;
+                        }
+                    }
+                } else if (rawCommand.startsWith("ADD_MEMBER")) {
+                    String[] res = commandString.split(" ");
+                    String nodeId = res[1];
+                    String nodeAddress = res[2];
+                    MemberChangeArgs request = MemberChangeArgs.newBuilder()
+                            .setType(MemberChangeArgs.ChangeType.ADD)
+                            .setNodeId(nodeId)
+                            .setNodeAddress(nodeAddress)
+                            .build();
+                    try {
+                        MemberChangeReply response = blockingStub.changeMembership(request);
+                        if (response.getSuccess()) {
+                            System.out.println("Member added successfully");
+                        } else {
+                            System.out.println("ERROR: " + response.getErrorMessage());
+                        }
+                    } catch (StatusRuntimeException e) {
+                        System.out.println("ERROR: Failed to add member: " + e.getStatus());
+                    }
+                    return;
+                } else if (rawCommand.startsWith("REMOVE_MEMBER")) {
+                    String[] res = commandString.split(" ");
+                    String nodeId = res[1];
+                    MemberChangeArgs request = MemberChangeArgs.newBuilder()
+                            .setType(MemberChangeArgs.ChangeType.REMOVE)
+                            .setNodeId(nodeId)
+                            .build();
+                    try {
+                        MemberChangeReply response = blockingStub.changeMembership(request);
+                        if (response.getSuccess()) {
+                            System.out.println("Member removed successfully");
+                        } else {
+                            System.out.println("ERROR: " + response.getErrorMessage());
+                        }
+                    } catch (StatusRuntimeException e) {
+                        System.out.println("ERROR: Failed to add member: " + e.getStatus());
+                    }
+                    return;
+                } else {
+                    String[] res = commandString.split(" ");
+                    String cmd = res[0];
+                    String key = res.length > 1 ? res[1] : null;
+                    String value = res.length > 2 ? res[2] : "";
+
+                    ClientRequest.Builder builder = ClientRequest.newBuilder().setType(ClientRequest.CommandType.valueOf(cmd));
+                    if (key != null) {
+                        builder.setKey(key);
+                    }
+                    if (value != null) {
+                        builder.setValue(value);
+                    }
+                    ClientRequest request = builder.build();
+                    logger.log(Level.INFO, "Sending command ''{0}'' to {1}", new Object[]{rawCommand, currentServerAddress});
+                    ClientResponse response = blockingStub.executeCommand(request);
+
+                    if (response.getSuccess()) {
+                        System.out.println(response.getResult());
+                        return;
+                    } else {
+                        if (!response.getLeaderAddress().isEmpty()) {
+                            logger.log(Level.INFO, "Not a leader.\nLeader address: {0}.\nTrying to redirect...", response.getLeaderAddress());
+                            System.out.println("REDIRECT: Not a leader. Trying to redirect to " + response.getLeaderAddress());
+                            connect(response.getLeaderAddress());
+                            redirects++;
+                        } else {
+                            logger.log(Level.WARNING, "Command failed: {0}", response.getResult());
+                            System.out.println("ERROR: " + (!response.getResult().isEmpty() ? response.getResult() : "Command failed."));
+                            return;
+                        }
+                    }
+                }
+            } catch (StatusRuntimeException e) {
+                logger.log(Level.SEVERE, "RPC failed to " + currentServerAddress + ": " + e.getStatus(), e);
+                System.out.println("ERROR: Failed to communicate to " + currentServerAddress + " (" + e.getStatus().getCode() + ").\nTry another server.");
+                return;
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Error when sending command to " + currentServerAddress + ": " + e.getMessage(), e);
+                System.out.println("ERROR: " + e.getMessage());
+                return;
+            }
+        }
+
+        logger.warning("Maximum redirect reached");
+        System.out.println("ERROR: Failed to redirect after " + MAX_REDIRECTS + " tries.");
+    }
+
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.err.println("Usage: Client <initial_server_address:port> [command...]");
+            System.exit(1);
+        }
+
+        String initialServerAddress = args[0];
+        Client client = new Client(initialServerAddress);
+
+        if (args.length > 1) {
+            List<String> commandParts = Arrays.asList(args).subList(1, args.length);
+            String commandString = String.join(" ", commandParts);
+            client.executeCommand(commandString);
+            client.shutdown();
+        } else {
+            System.out.println("Enter 'exit' or 'quit' to exit the client.");
+            System.out.println("Enter 'connect <host:port>' to change the server connectino");
+            try (Scanner scanner = new Scanner(System.in)) {
+                while (true) {
+                    if (client.currentServerAddress != null) {
+                        System.out.print("[" + client.currentServerAddress + "] > ");
+                    } else {
+                        System.out.print("[disconnected] > ");
+                    }
+                    String line = scanner.nextLine();
+                    if (line == null) break;
+                    
+                    String trimmedLine = line.trim();
+                    if (trimmedLine.isEmpty()) continue;
+                    
+                    client.executeCommand(trimmedLine);
+                }
+            }
+            client.shutdown();
+        }
+    }
+}
