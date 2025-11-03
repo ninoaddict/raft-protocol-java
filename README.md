@@ -1,4 +1,5 @@
 # Raft Protocol Implementation for Key-Value Store
+![Demo image](https://github.com/ninoaddict/raft-protocol-java/blob/main/public/demo.png)
 
 This project implements the Raft consensus protocol for a distributed key-value store system based on the [original Raft paper](https://raft.github.io/raft.pdf). The implementation uses Java and gRPC for network communication between nodes.
 
